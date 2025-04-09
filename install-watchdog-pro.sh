@@ -41,16 +41,25 @@ pip install watchdog
 
 echo "[+] Writing file monitor script..."
 cat <<EOL > $SCRIPT_PATH
-import os
+
+EOL
+
+echo "[+] Creating systemd service..."
+cat <<EOL | sudo tee $SERVICE_PATH > /dev/null
+[Unit]
+Description=Watchdog File Monitor
+After=network.targetimport os
 import time
 import logging
-import gzip
 import shutil
-from datetime import datetime
+import gzip
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+from datetime import datetime
+import pwd
+import grp
 
-LOG_FILE = "$LOG_FILE"
+LOG_FILE = "/var/log/watchdog.log"
 COMPRESS_INTERVAL = 3600
 LOG_RETENTION_DAYS = 7
 
@@ -59,132 +68,182 @@ ICONS = {
     'modified': '🔧',
     'deleted': '🗑️',
     'moved': '🔄',
+    'copy': '📋',
     'dir': '📘',
     'file': '📄',
-    'copied': '📥'
+    'symlink': '🔗',
+    'hardlink': '🪝',
+    'perms': '🔒',
+    'owner': '👤'
 }
 
-EXCLUDE_DIRS = [
-    "/proc", "/sys", "/dev", "/run", "/tmp", "/var/cache", "/var/tmp", LOG_FILE
-]
+EXCLUDE_DIRS = ["/proc", "/sys", "/dev", "/run", "/tmp", "/var/cache", "/var/tmp", LOG_FILE]
 
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s - %(message)s")
 
 class FileMonitorHandler(FileSystemEventHandler):
     def __init__(self):
         self.file_sizes = {}
-        self.recent_creations = {}
+        self.inode_map = {}
+        self.permissions = {}  # Track permissions
+        self.ownership = {}   # Track owner:group
 
     def format_size(self, size):
-        for unit in ['B','KB','MB','GB','TB']:
+        for unit in ['B', 'KB', 'MB', 'GB']:
             if size < 1024:
                 return f"{size:.2f} {unit}"
             size /= 1024
-        return f"{size:.2f} PB"
+        return f"{size:.2f} TB"
+
+    def get_file_info(self, path):
+        try:
+            stat = os.stat(path)
+            perms = oct(stat.st_mode)[-3:]  # Last 3 octal digits for permissions
+            owner = pwd.getpwuid(stat.st_uid).pw_name
+            group = grp.getgrgid(stat.st_gid).gr_name
+            return perms, f"{owner}:{group}"
+        except:
+            return "???", "unknown:unknown"
 
     def should_ignore(self, path):
         return any(path.startswith(ex) for ex in EXCLUDE_DIRS)
 
     def log_event(self, action, path, icon):
         if self.should_ignore(path): return
-        kind = ICONS['dir'] if os.path.isdir(path) else ICONS['file']
-        logging.info(f"{icon} {action.upper()} {kind} {path}")
+        typ = ICONS['dir'] if os.path.isdir(path) else ICONS['file']
+        logging.info(f"{icon} {action.upper()} {typ} {path}")
+
+    def check_perm_owner_changes(self, path):
+        if self.should_ignore(path) or not os.path.exists(path):
+            return
+        
+        current_perms, current_owner = self.get_file_info(path)
+        old_perms = self.permissions.get(path)
+        old_owner = self.ownership.get(path)
+
+        # Check permission changes
+        if old_perms and old_perms != current_perms:
+            logging.info(f"{ICONS['perms']} PERMISSIONS CHANGED {ICONS['file']} {path}: "
+                        f"{old_perms} ➡️ {current_perms} (owner: {current_owner})")
+
+        # Check ownership changes
+        if old_owner and old_owner != current_owner:
+            logging.info(f"{ICONS['owner']} OWNERSHIP CHANGED {ICONS['file']} {path}: "
+                        f"{old_owner} ➡️ {current_owner} (perms: {current_perms})")
+
+        # Update tracking
+        self.permissions[path] = current_perms
+        self.ownership[path] = current_owner
 
     def on_created(self, event):
         path = event.src_path
         if self.should_ignore(path): return
-        self.log_event('created', path, ICONS['created'])
-        if not event.is_directory and os.path.exists(path):
-            size = os.path.getsize(path)
-            self.file_sizes[path] = size
-            self.recent_creations[path] = (time.time(), size)
+
+        try:
+            if os.path.islink(path):
+                logging.info(f"{ICONS['symlink']} SYMLINK CREATED {path} -> {os.readlink(path)}")
+            elif os.path.isfile(path):
+                stat = os.lstat(path)
+                inode = stat.st_ino
+                perms, owner = self.get_file_info(path)
+                self.permissions[path] = perms
+                self.ownership[path] = owner
+
+                if inode in self.inode_map:
+                    source = self.inode_map[inode]
+                    logging.info(f"{ICONS['copy']} COPY DETECTED {source} ➡️ {path}")
+                else:
+                    self.inode_map[inode] = path
+
+                if stat.st_nlink > 1:
+                    logging.info(f"{ICONS['hardlink']} HARD LINK DETECTED: {path} (inode: {inode}, links: {stat.st_nlink})")
+
+                self.file_sizes[path] = stat.st_size
+        except Exception as e:
+            logging.error(f"Error on created event: {e}")
+
+        self.log_event("created", path, ICONS['created'])
 
     def on_deleted(self, event):
         path = event.src_path
-        self.log_event('deleted', path, ICONS['deleted'])
+        self.log_event("deleted", path, ICONS['deleted'])
         self.file_sizes.pop(path, None)
-        self.recent_creations.pop(path, None)
+        self.permissions.pop(path, None)
+        self.ownership.pop(path, None)
 
     def on_moved(self, event):
         if self.should_ignore(event.src_path): return
-        kind = ICONS['dir'] if event.is_directory else ICONS['file']
-        logging.info(f"{ICONS['moved']} MOVED {kind} {event.src_path} ➡️ {event.dest_path}")
-        if not event.is_directory:
-            self.file_sizes[event.dest_path] = self.file_sizes.pop(event.src_path, 0)
+        typ = ICONS['dir'] if event.is_directory else ICONS['file']
+        logging.info(f"{ICONS['moved']} MOVED {typ} {event.src_path} ➡️ {event.dest_path}")
+        self.file_sizes[event.dest_path] = self.file_sizes.pop(event.src_path, 0)
+        self.permissions[event.dest_path] = self.permissions.pop(event.src_path, None)
+        self.ownership[event.dest_path] = self.ownership.pop(event.src_path, None)
+        self.check_perm_owner_changes(event.dest_path)
 
     def on_modified(self, event):
         path = event.src_path
         if event.is_directory or self.should_ignore(path): return
-        if not os.path.exists(path): return
-        new_size = os.path.getsize(path)
-        old_size = self.file_sizes.get(path, new_size)
-        delta = new_size - old_size
+        try:
+            new_size = os.path.getsize(path)
+            old_size = self.file_sizes.get(path, new_size)
+            self.check_perm_owner_changes(path)  # Check permissions and ownership
 
-        if new_size != old_size:
-            change = "➕" if delta > 0 else "➖"
-            logging.info(f"{ICONS['modified']} MODIFIED {ICONS['file']} {path} {change} {self.format_size(abs(delta))} (old: {self.format_size(old_size)}, new: {self.format_size(new_size)})")
-        else:
-            logging.info(f"{ICONS['modified']} MODIFIED {ICONS['file']} {path}")
+            if new_size != old_size:
+                delta = new_size - old_size
+                change = "➕" if delta > 0 else "➖"
+                perms, owner = self.get_file_info(path)
+                logging.info(
+                    f"{ICONS['modified']} MODIFIED {ICONS['file']} {path} {change} {self.format_size(abs(delta))} "
+                    f"(old: {self.format_size(old_size)}, new: {self.format_size(new_size)}, "
+                    f"perms: {perms}, owner: {owner})"
+                )
+            else:
+                perms, owner = self.get_file_info(path)
+                logging.info(f"{ICONS['modified']} MODIFIED {ICONS['file']} {path} "
+                           f"(perms: {perms}, owner: {owner})")
+            self.file_sizes[path] = new_size
+        except Exception as e:
+            logging.error(f"Error on modified event: {e}")
 
-        self.file_sizes[path] = new_size
-
-    def detect_possible_copy(self):
-        now = time.time()
-        threshold = 10  # seconds
-        for path, (ctime, size) in list(self.recent_creations.items()):
-            if now - ctime < threshold:
-                for other, (o_ctime, o_size) in self.recent_creations.items():
-                    if path != other and abs(size - o_size) < 10:
-                        logging.info(f"{ICONS['copied']} POSSIBLE COPY 📄 {other} ➡️ {path}")
-
-def get_monitor_paths():
-    paths = ["/home", "/etc", "/usr", "/opt", "/root"]
-    return [p for p in paths if os.path.exists(p)]
+def get_paths():
+    return [p for p in ["/home", "/etc", "/usr", "/opt", "/root"] if os.path.exists(p)]
 
 def compress_log():
     if not os.path.exists(LOG_FILE): return
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    compressed = f"{LOG_FILE}_{timestamp}.gz"
-    with open(LOG_FILE, "rb") as f_in, gzip.open(compressed, "wb") as f_out:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = f"{LOG_FILE}_{ts}.gz"
+    with open(LOG_FILE, "rb") as f_in, gzip.open(dest, "wb") as f_out:
         shutil.copyfileobj(f_in, f_out)
     open(LOG_FILE, 'w').close()
-    logging.info(f"Compressed log saved: {compressed}")
+    logging.info(f"Compressed log: {dest}")
 
 def delete_old_logs():
     now = time.time()
-    for fname in os.listdir("/var/log"):
-        if fname.startswith("watchdog.log") and fname.endswith(".gz"):
-            fpath = os.path.join("/var/log", fname)
-            if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > LOG_RETENTION_DAYS * 86400:
-                os.remove(fpath)
-                logging.info(f"Deleted old log: {fpath}")
+    for f in os.listdir("/var/log"):
+        path = os.path.join("/var/log", f)
+        if f.startswith("watchdog.log") and f.endswith(".gz") and os.path.isfile(path):
+            if now - os.path.getmtime(path) > LOG_RETENTION_DAYS * 86400:
+                os.remove(path)
+                logging.info(f"Deleted old log: {path}")
 
 def main():
     handler = FileMonitorHandler()
-    observer = Observer()
-    for path in get_monitor_paths():
-        observer.schedule(handler, path, recursive=True)
-    observer.start()
+    obs = Observer()
+    for p in get_paths():
+        obs.schedule(handler, p, recursive=True)
+    obs.start()
     logging.info("📢 Watchdog started.")
     try:
         while True:
-            handler.detect_possible_copy()
             compress_log()
             delete_old_logs()
             time.sleep(COMPRESS_INTERVAL)
     except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
+        obs.stop()
+    obs.join()
 
 if __name__ == "__main__":
     main()
-EOL
-
-echo "[+] Creating systemd service..."
-cat <<EOL | sudo tee $SERVICE_PATH > /dev/null
-[Unit]
-Description=Watchdog File Monitor
-After=network.target
 
 [Service]
 Type=simple
