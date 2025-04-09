@@ -6,24 +6,48 @@ SCRIPT_PATH="/opt/file_monitor.py"
 SERVICE_PATH="/etc/systemd/system/watchdog.service"
 LOG_FILE="/var/log/file_changes.log"
 
-# Update package list and install required packages
-echo "Updating system and installing required packages..."
-sudo apt update -y
-sudo apt install -y python3-venv python3-pip
+# Detect OS and package manager
+if command -v apt &> /dev/null; then
+    PKG_UPDATE="sudo apt update -y"
+    PKG_INSTALL="sudo apt install -y python3-venv python3-pip"
+elif command -v dnf &> /dev/null; then
+    PKG_UPDATE="sudo dnf makecache"
+    PKG_INSTALL="sudo dnf install -y python3 python3-pip python3-virtualenv"
+elif command -v yum &> /dev/null; then
+    # Optional: Enable EPEL for python3-pip if needed
+    sudo yum install -y epel-release
+    PKG_UPDATE="sudo yum makecache"
+    PKG_INSTALL="sudo yum install -y python3 python3-pip python3-virtualenv"
+else
+    echo "❌ Unsupported OS or package manager. Please install Python manually."
+    exit 1
+fi
 
-# Create a virtual environment
-echo "Creating virtual environment at $VENV_DIR..."
-python3 -m venv $VENV_DIR
+# Check for systemd
+if ! command -v systemctl &> /dev/null; then
+    echo "❌ systemctl not found. This script requires systemd."
+    exit 1
+fi
+
+# Update system and install packages
+echo "🔧 Updating system and installing required packages..."
+eval "$PKG_UPDATE"
+eval "$PKG_INSTALL"
+
+# Create virtual environment
+echo "🐍 Creating virtual environment at $VENV_DIR..."
+python3 -m venv $VENV_DIR || virtualenv $VENV_DIR
 
 # Activate virtual environment
 source $VENV_DIR/bin/activate
 
 # Install required Python packages
-echo "Installing required Python packages..."
+echo "📦 Installing Python watchdog..."
+pip install --upgrade pip
 pip install watchdog
 
 # Create the file monitor script
-echo "Creating the file monitor script..."
+echo "📝 Creating the file monitor script..."
 cat <<EOL > $SCRIPT_PATH
 import os
 import logging
@@ -34,23 +58,18 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from datetime import datetime, timedelta
 
-# Configure logging
-LOG_FILE = "$LOG_FILE"  # You can change this to any path you prefer
+LOG_FILE = "$LOG_FILE"
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s - %(message)s")
 
-# Time interval for log file compression (in seconds)
-COMPRESS_INTERVAL = 3600  # 1 hour
+COMPRESS_INTERVAL = 3600
 LOG_RETENTION_DAYS = 7
 
-# Unicode icons for different events
-MODIFIED_ICON = "🔄"  # Modified event
-CREATED_ICON = "✨"   # Created event
-DELETED_ICON = "❌"   # Deleted event
-MOVED_ICON = "🔀"     # Moved event
+MODIFIED_ICON = "🔄"
+CREATED_ICON = "✨"
+DELETED_ICON = "❌"
+MOVED_ICON = "🔀"
 
 class FileMonitorHandler(FileSystemEventHandler):
-    """Handles file system events (create, modify, delete, move)"""
-    
     def on_modified(self, event):
         if not event.is_directory:
             logging.info(f"{MODIFIED_ICON} Modified: {event.src_path}")
@@ -68,12 +87,10 @@ class FileMonitorHandler(FileSystemEventHandler):
             logging.info(f"{MOVED_ICON} Moved: {event.src_path} to {event.dest_path}")
 
 def get_existing_paths():
-    """Returns only existing system directories to prevent errors (removed /var)"""
-    paths = ["/home", "/etc", "/root", "/usr", "/opt"]  # /var has been removed
+    paths = ["/home", "/etc", "/root", "/usr", "/opt"]
     return [path for path in paths if os.path.exists(path)]
 
 def compress_log():
-    """Compress the log file every hour"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     compressed_log = f"{LOG_FILE}_{timestamp}.gz"
     
@@ -81,20 +98,17 @@ def compress_log():
         with gzip.open(compressed_log, "wb") as f_out:
             shutil.copyfileobj(f_in, f_out)
 
-    # Clear the original log file after compression
     open(LOG_FILE, 'w').close()
-
     logging.info(f"Log compressed and saved as: {compressed_log}")
 
 def delete_old_logs():
-    """Delete log files older than 7 days"""
     current_time = time.time()
     for filename in os.listdir('/var/log'):
         if filename.startswith("file_changes.log"):
             file_path = os.path.join('/var/log', filename)
             if os.path.isfile(file_path):
                 file_mod_time = os.path.getmtime(file_path)
-                if current_time - file_mod_time > LOG_RETENTION_DAYS * 86400:  # 86400 seconds = 1 day
+                if current_time - file_mod_time > LOG_RETENTION_DAYS * 86400:
                     os.remove(file_path)
                     logging.info(f"Deleted old log file: {file_path}")
 
@@ -102,17 +116,14 @@ def main():
     event_handler = FileMonitorHandler()
     observer = Observer()
 
-    # Add all system paths
     for path in get_existing_paths():
         observer.schedule(event_handler, path, recursive=True)
     
     observer.start()
     logging.info("📢 File Integrity Monitoring Started!")
 
-    # Set up log rotation (compression and deletion) in a background thread
     while True:
         try:
-            # Run log compression every hour
             compress_log()
             time.sleep(COMPRESS_INTERVAL)
             delete_old_logs()
@@ -129,9 +140,17 @@ if __name__ == "__main__":
     main()
 EOL
 
-# Create systemd service file for the script
-echo "Creating systemd service file..."
-cat <<EOL | sudo tee $SERVICE_PATH
+# Ensure log file exists and is writable
+sudo touch $LOG_FILE
+sudo chown root:root $LOG_FILE
+sudo chmod 644 $LOG_FILE
+
+# Make the Python script executable
+chmod +x $SCRIPT_PATH
+
+# Create systemd service
+echo "⚙️ Creating systemd service..."
+cat <<EOL | sudo tee $SERVICE_PATH > /dev/null
 [Unit]
 Description=File Integrity Monitor
 After=network.target
@@ -145,18 +164,19 @@ Group=root
 Restart=always
 Environment="PATH=$VENV_DIR/bin:/usr/bin:/bin"
 Environment="PYTHONUNBUFFERED=1"
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 EOL
 
-# Reload systemd and enable the service
-echo "Reloading systemd, enabling and starting the service..."
+# Reload systemd and enable service
+echo "🚀 Enabling and starting service..."
 sudo systemctl daemon-reload
-sudo systemctl enable fwatchdog.service
+sudo systemctl enable watchdog.service
 sudo systemctl start watchdog.service
 
-echo "File Integrity Monitor service installed and started successfully!"
-
-# Check service status
-sudo systemctl status watchdog.service
+# Show status
+echo "✅ File Integrity Monitor service installed and started successfully!"
+sudo systemctl status watchdog.service --no-pager
