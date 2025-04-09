@@ -5,6 +5,17 @@ VENV_DIR="/opt/watchdog_env"
 SCRIPT_PATH="/opt/file_monitor.py"
 SERVICE_PATH="/etc/systemd/system/watchdog.service"
 LOG_FILE="/var/log/watchdog.log"
+INSTALL_FLAG="/var/log/.install-watchdog-pro.log"
+
+
+# Check for previous installation
+if [ -f "$INSTALL_FLAG" ]; then
+    echo "⛔ Watchdog is already installed. Please check the service or uninstall before reinstalling."
+    echo "ℹ️  Log File: $LOG_FILE"
+    echo "ℹ️  Installed marker: $INSTALL_FLAG"
+    exit 0
+fi
+
 
 echo "[+] Detecting OS and installing dependencies..."
 
