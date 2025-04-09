@@ -4,48 +4,52 @@
 VENV_DIR="/opt/watchdog_env"
 SCRIPT_PATH="/opt/file_monitor.py"
 SERVICE_PATH="/etc/systemd/system/watchdog.service"
-LOG_FILE="/var/log/file_changes.log"
+LOG_FILE="/var/log/watchdog.log"
 
-# Detect OS and package manager
-if command -v apt &> /dev/null; then
-    PKG_UPDATE="sudo apt update -y"
-    PKG_INSTALL="sudo apt install -y python3-venv python3-pip"
-elif command -v dnf &> /dev/null; then
-    PKG_UPDATE="sudo dnf makecache"
-    PKG_INSTALL="sudo dnf install -y python3 python3-pip python3-virtualenv"
-elif command -v yum &> /dev/null; then
-    sudo yum install -y epel-release
-    PKG_UPDATE="sudo yum makecache"
-    PKG_INSTALL="sudo yum install -y python3 python3-pip python3-virtualenv"
+echo "📦 Detecting OS and installing dependencies..."
+
+# OS detection and dependency installation
+if [ -f /etc/debian_version ]; then
+    echo "✅ Detected Debian-based system (Ubuntu/Debian)"
+    sudo apt update -y
+    sudo apt install -y python3 python3-venv python3-pip
+elif [ -f /etc/redhat-release ] || grep -qi 'fedora' /etc/os-release; then
+    OS_NAME=$(cat /etc/os-release | grep "^NAME=" | cut -d= -f2 | tr -d '"')
+    case "$OS_NAME" in
+        *Rocky*)
+            echo "✅ Detected Rocky Linux"
+            ;;
+        *CentOS*)
+            echo "✅ Detected CentOS"
+            ;;
+        *Red\ Hat*)
+            echo "✅ Detected Red Hat Enterprise Linux"
+            ;;
+        *Fedora*)
+            echo "✅ Detected Fedora"
+            ;;
+        *)
+            echo "⚠️  Detected RHEL-based system: $OS_NAME"
+            ;;
+    esac
+    sudo dnf install -y python3 python3-pip || sudo yum install -y python3 python3-pip
 else
-    echo "❌ Unsupported OS or package manager."
+    echo "❌ Unsupported OS. Only Ubuntu/Debian and RHEL-based systems (CentOS, Rocky, Fedora, RHEL) are supported."
     exit 1
 fi
 
-# Check for systemctl
-if ! command -v systemctl &> /dev/null; then
-    echo "❌ systemctl not found. This script requires systemd."
-    exit 1
-fi
+# Create Python virtual environment
+echo "🐍 Creating Python virtual environment at $VENV_DIR..."
+python3 -m venv "$VENV_DIR"
 
-# Update and install
-echo "🔧 Installing required packages..."
-eval "$PKG_UPDATE"
-eval "$PKG_INSTALL"
-
-# Virtual environment
-echo "🐍 Setting up Python virtual environment..."
-python3 -m venv $VENV_DIR || virtualenv $VENV_DIR
-source $VENV_DIR/bin/activate
-
-# Install Python package
-echo "📦 Installing watchdog..."
+# Activate virtual environment and install watchdog
+source "$VENV_DIR/bin/activate"
 pip install --upgrade pip
 pip install watchdog
 
-# Create monitor script
-echo "📝 Creating file monitor script..."
-cat <<EOL > $SCRIPT_PATH
+# Create the Python monitoring script
+echo "📝 Writing file monitor script to $SCRIPT_PATH..."
+cat <<EOF > "$SCRIPT_PATH"
 import os
 import logging
 import time
@@ -58,91 +62,87 @@ from datetime import datetime
 LOG_FILE = "$LOG_FILE"
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s - %(message)s")
 
-COMPRESS_INTERVAL = 3600
+COMPRESS_INTERVAL = 3600  # 1 hour
 LOG_RETENTION_DAYS = 7
 
-# Emojis for event types
-EVENT_ICONS = {
-    'CREATED': "✨",
-    'MODIFIED': "🔄",
-    'DELETED': "❌",
-    'MOVED': "🔀"
+ICONS = {
+    'created': "🌱",
+    'modified': "🔧",
+    'deleted': "🗑️",
+    'moved': "🔄",
+    'file': "📄",
+    'dir': "📘"
 }
 
 class FileMonitorHandler(FileSystemEventHandler):
-    def on_any_event(self, event):
-        event_type = event.event_type.upper()
-        kind = "[DIR]" if event.is_directory else "[FILE]"
-        icon = EVENT_ICONS.get(event_type, "📁")
-
-        if hasattr(event, 'dest_path'):  # Moved event
-            logging.info(f"{icon} {event_type} {kind}: {event.src_path} ➡️ {event.dest_path}")
+    def log_event(self, event_type, event):
+        icon_type = ICONS['dir'] if event.is_directory else ICONS['file']
+        if event_type == "moved":
+            message = f"{ICONS[event_type]} {event_type.upper()} {icon_type} {event.src_path} ➡️ {icon_type} {event.dest_path}"
         else:
-            logging.info(f"{icon} {event_type} {kind}: {event.src_path}")
+            message = f"{ICONS[event_type]} {event_type.upper()} {icon_type} {event.src_path}"
+        logging.info(message)
+
+    def on_created(self, event): self.log_event("created", event)
+    def on_modified(self, event): self.log_event("modified", event)
+    def on_deleted(self, event): self.log_event("deleted", event)
+    def on_moved(self, event): self.log_event("moved", event)
 
 def get_existing_paths():
-    paths = ["/home", "/etc", "/root", "/usr", "/opt"]
-    return [path for path in paths if os.path.exists(path)]
+    include_paths = ["/home", "/etc", "/root", "/usr", "/opt"]
+    exclude_paths = ["/proc", "/sys", "/dev", "/run", "/tmp", "/var/cache", "/var/log"]
+    return [p for p in include_paths if os.path.exists(p) and all(not p.startswith(ex) for ex in exclude_paths)]
 
 def compress_log():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    compressed_log = f"{LOG_FILE}_{timestamp}.gz"
-    with open(LOG_FILE, "rb") as f_in:
-        with gzip.open(compressed_log, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
+    compressed_log = f"{LOG_FILE}_\{timestamp}.gz"
+    with open(LOG_FILE, "rb") as f_in, gzip.open(compressed_log, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
     open(LOG_FILE, 'w').close()
-    logging.info(f"Log compressed and saved as: {compressed_log}")
+    logging.info(f"Compressed log saved: {compressed_log}")
 
 def delete_old_logs():
-    current_time = time.time()
+    now = time.time()
     for filename in os.listdir('/var/log'):
-        if filename.startswith("file_changes.log") and filename.endswith(".gz"):
+        if filename.startswith("watchdog.log") and filename.endswith(".gz"):
             file_path = os.path.join('/var/log', filename)
             if os.path.isfile(file_path):
-                file_mod_time = os.path.getmtime(file_path)
-                if current_time - file_mod_time > LOG_RETENTION_DAYS * 86400:
+                file_time = os.path.getmtime(file_path)
+                if now - file_time > LOG_RETENTION_DAYS * 86400:
                     os.remove(file_path)
-                    logging.info(f"Deleted old log file: {file_path}")
+                    logging.info(f"Deleted old log: {file_path}")
 
 def main():
     event_handler = FileMonitorHandler()
     observer = Observer()
     for path in get_existing_paths():
         observer.schedule(event_handler, path, recursive=True)
-    observer.start()
-    logging.info("📢 File Integrity Monitoring Started!")
 
-    while True:
-        try:
+    observer.start()
+    logging.info("📢 File monitoring started!")
+
+    try:
+        while True:
             compress_log()
             time.sleep(COMPRESS_INTERVAL)
             delete_old_logs()
-        except KeyboardInterrupt:
-            observer.stop()
-            logging.info("❌ File Integrity Monitoring Stopped!")
-            break
-        except Exception as e:
-            logging.error(f"Error: {str(e)}")
+    except KeyboardInterrupt:
+        observer.stop()
+        logging.info("❌ File monitoring stopped.")
+    except Exception as e:
+        logging.error(f"Error: {str(e)}")
 
     observer.join()
 
 if __name__ == "__main__":
     main()
-EOL
+EOF
 
-# Ensure log file exists
-sudo touch $LOG_FILE
-sudo chown root:root $LOG_FILE
-sudo chmod 644 $LOG_FILE
-
-# Make script executable
-chmod +x $SCRIPT_PATH
-
-# Create systemd service
-echo "⚙️ Creating systemd service..."
-cat <<EOL | sudo tee $SERVICE_PATH > /dev/null
+# Create the systemd service file
+echo "🔧 Creating systemd service..."
+cat <<EOF | sudo tee "$SERVICE_PATH"
 [Unit]
-Description=File Integrity Monitor
+Description=File Integrity Watchdog
 After=network.target
 
 [Service]
@@ -154,22 +154,16 @@ Group=root
 Restart=always
 Environment="PATH=$VENV_DIR/bin:/usr/bin:/bin"
 Environment="PYTHONUNBUFFERED=1"
-StandardOutput=journal
-StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-EOL
+EOF
 
-# Reload and start service
+# Enable and start the service
 echo "🚀 Enabling and starting watchdog service..."
 sudo systemctl daemon-reload
 sudo systemctl enable watchdog.service
-sudo systemctl start watchdog.service
+sudo systemctl restart watchdog.service
 
-# Display status
-echo "✅ File Integrity Monitor is active!"
-sudo systemctl status watchdog.service --no-pager
-
-echo "ℹ️ If using SELinux (RHEL/CentOS/Rocky), and it blocks the service, run:"
-echo "   sudo setenforce 0"
+echo "✅ Installation complete! Service is running."
+sudo systemctl status watchdog.service
