@@ -15,18 +15,24 @@ if [ -f "$INSTALL_FLAG" ]; then
     exit 0
 fi
 
+# Check for root privileges
+if [ "$EUID" -ne 0 ]; then
+    echo "❌ This script must be run as root. Please use sudo."
+    exit 1
+fi
+
 echo "[+] Detecting OS and installing dependencies..."
 if [ -f /etc/debian_version ]; then
     echo "✅ Detected Debian-based system (Ubuntu/Debian)"
-    sudo apt update -y
-    sudo apt install -y python3 python3-venv python3-pip
+    apt update -y
+    apt install -y python3 python3-venv python3-pip
 elif [ -f /etc/redhat-release ] || grep -qi 'fedora' /etc/os-release; then
     OS_NAME=$(grep "^NAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
     echo "✅ Detected $OS_NAME"
     if command -v dnf &> /dev/null; then
-        sudo dnf install -y python3 python3-pip
+        dnf install -y python3 python3-pip
     else
-        sudo yum install -y python3 python3-pip
+        yum install -y python3 python3-pip
     fi
 else
     echo "❌ Unsupported OS."
@@ -34,21 +40,14 @@ else
 fi
 
 echo "[+] Setting up virtual environment..."
-python3 -m venv $VENV_DIR
-source $VENV_DIR/bin/activate
+python3 -m venv "$VENV_DIR"
+source "$VENV_DIR/bin/activate"
 pip install --upgrade pip
 pip install watchdog
 
 echo "[+] Writing file monitor script..."
-cat <<EOL > $SCRIPT_PATH
-
-EOL
-
-echo "[+] Creating systemd service..."
-cat <<EOL | sudo tee $SERVICE_PATH > /dev/null
-[Unit]
-Description=Watchdog File Monitor
-After=network.targetimport os
+cat <<'EOL' > "$SCRIPT_PATH"
+import os
 import time
 import logging
 import shutil
@@ -85,8 +84,8 @@ class FileMonitorHandler(FileSystemEventHandler):
     def __init__(self):
         self.file_sizes = {}
         self.inode_map = {}
-        self.permissions = {}  # Track permissions
-        self.ownership = {}   # Track owner:group
+        self.permissions = {}
+        self.ownership = {}
 
     def format_size(self, size):
         for unit in ['B', 'KB', 'MB', 'GB']:
@@ -98,7 +97,7 @@ class FileMonitorHandler(FileSystemEventHandler):
     def get_file_info(self, path):
         try:
             stat = os.stat(path)
-            perms = oct(stat.st_mode)[-3:]  # Last 3 octal digits for permissions
+            perms = oct(stat.st_mode)[-3:]
             owner = pwd.getpwuid(stat.st_uid).pw_name
             group = grp.getgrgid(stat.st_gid).gr_name
             return perms, f"{owner}:{group}"
@@ -121,17 +120,14 @@ class FileMonitorHandler(FileSystemEventHandler):
         old_perms = self.permissions.get(path)
         old_owner = self.ownership.get(path)
 
-        # Check permission changes
         if old_perms and old_perms != current_perms:
             logging.info(f"{ICONS['perms']} PERMISSIONS CHANGED {ICONS['file']} {path}: "
                         f"{old_perms} ➡️ {current_perms} (owner: {current_owner})")
 
-        # Check ownership changes
         if old_owner and old_owner != current_owner:
             logging.info(f"{ICONS['owner']} OWNERSHIP CHANGED {ICONS['file']} {path}: "
                         f"{old_owner} ➡️ {current_owner} (perms: {current_perms})")
 
-        # Update tracking
         self.permissions[path] = current_perms
         self.ownership[path] = current_owner
 
@@ -186,7 +182,7 @@ class FileMonitorHandler(FileSystemEventHandler):
         try:
             new_size = os.path.getsize(path)
             old_size = self.file_sizes.get(path, new_size)
-            self.check_perm_owner_changes(path)  # Check permissions and ownership
+            self.check_perm_owner_changes(path)
 
             if new_size != old_size:
                 delta = new_size - old_size
@@ -244,6 +240,16 @@ def main():
 
 if __name__ == "__main__":
     main()
+EOL
+
+echo "[+] Setting permissions for script..."
+chmod 755 "$SCRIPT_PATH"
+
+echo "[+] Creating systemd service..."
+cat <<EOL > "$SERVICE_PATH"
+[Unit]
+Description=Watchdog File Monitor
+After=network.target
 
 [Service]
 Type=simple
@@ -259,11 +265,30 @@ Environment="PYTHONUNBUFFERED=1"
 WantedBy=multi-user.target
 EOL
 
+echo "[+] Setting permissions for service file..."
+chmod 644 "$SERVICE_PATH"
+
 echo "[+] Enabling and starting service..."
-sudo systemctl daemon-reload
-sudo systemctl enable watchdog.service
-sudo systemctl start watchdog.service
+systemctl daemon-reload
+systemctl enable watchdog.service
+systemctl start watchdog.service
+
+# Verify service status
+sleep 2
+if systemctl is-active watchdog.service > /dev/null; then
+    echo "[✅] Watchdog service started successfully!"
+else
+    echo "[❌] Failed to start Watchdog service. Check logs: $LOG_FILE"
+    exit 1
+fi
 
 touch "$INSTALL_FLAG"
-echo "[✅] Watchdog installed!"
+echo "[✅] Watchdog installed successfully!"
 echo "[📁] Log: $LOG_FILE"
+echo "[ℹ️] To check status: systemctl status watchdog.service"
+echo "[ℹ️] To view logs: tail -f $LOG_FILE"
+echo ""
+echo "  🐶 Watchdog is on duty!"
+echo "  /_/\  "
+echo " (o.o) "
+echo " > ^ <"
